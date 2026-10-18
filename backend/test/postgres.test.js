@@ -1,6 +1,8 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const Module = require("node:module");
 const { test } = require("node:test");
+const { io: createSocketClient } = require("socket.io-client");
 
 test("frontend API helpers target the backend and safely parse error bodies", async () => {
   const { resolveApiUrl } = await import("../../frontend/src/api-config.js");
@@ -213,6 +215,8 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     displayName: "Meet Up Tester",
   };
   let sessionCookie;
+  let roomCookie;
+  let roomCode;
 
   await t.test("initializes the PostgreSQL schema and indexes", async () => {
     const schema = statements.find(({ sql }) => sql.includes("CREATE TABLE IF NOT EXISTS users"));
@@ -263,6 +267,28 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     assert.ok([...sessions.keys()].every((hash) => hash !== token));
   });
 
+  await t.test("validates registration input and malformed JSON", async () => {
+    const invalidRegistration = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ ...credentials, displayName: " " }),
+    });
+    assert.equal(invalidRegistration.status, 400);
+    assert.deepEqual(await invalidRegistration.json(), {
+      error: "Display name must contain 1-40 readable characters.",
+    });
+
+    const malformedJson = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: '{"email":',
+    });
+    assert.equal(malformedJson.status, 400);
+    assert.deepEqual(await malformedJson.json(), {
+      error: "The request body is invalid.",
+    });
+  });
+
   await t.test("logs in with the stored password hash", async () => {
     const response = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
@@ -284,6 +310,16 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
       }),
     });
     assert.equal(invalidResponse.status, 401);
+
+    const invalidCredentials = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "not-an-email", password: "short" }),
+    });
+    assert.equal(invalidCredentials.status, 400);
+    assert.deepEqual(await invalidCredentials.json(), {
+      error: "Enter a valid email address.",
+    });
   });
 
   await t.test("rejects duplicate email addresses", async () => {
@@ -316,7 +352,7 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     assert.equal(revoked.status, 401);
   });
 
-  await t.test("creates a persistent room for the authenticated owner", async () => {
+  await t.test("rejects expired sessions", async () => {
     const login = await fetch(`${baseUrl}/api/auth/login`, {
       method: "POST",
       headers: { Origin: origin, "Content-Type": "application/json" },
@@ -327,12 +363,34 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     });
     assert.equal(login.status, 200);
     const cookie = login.headers.get("set-cookie").split(";")[0];
+    const token = cookie.slice(cookie.indexOf("=") + 1);
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    sessions.get(tokenHash).expires_at = Date.now() - 1;
+
+    const expired = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(expired.status, 401);
+    assert.deepEqual(await expired.json(), { error: "Sign in to continue." });
+  });
+
+  await t.test("creates a persistent room for the authenticated owner", async () => {
+    const login = await fetch(`${baseUrl}/api/auth/login`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: credentials.email,
+        password: credentials.password,
+      }),
+    });
+    assert.equal(login.status, 200);
+    roomCookie = login.headers.get("set-cookie").split(";")[0];
 
     const response = await fetch(`${baseUrl}/api/rooms`, {
       method: "POST",
       headers: {
         Origin: origin,
-        Cookie: cookie,
+        Cookie: roomCookie,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ name: "Automated test room" }),
@@ -342,9 +400,10 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     assert.match(room.code, /^[0-9A-F]{32}$/);
     assert.equal(room.name, "Automated test room");
     assert.equal(rooms.get(room.code).owner_user_id, users.values().next().value.id);
+    roomCode = room.code;
 
     const lookup = await fetch(`${baseUrl}/api/rooms/${room.code.toLowerCase()}`, {
-      headers: { Cookie: cookie },
+      headers: { Cookie: roomCookie },
     });
     assert.equal(lookup.status, 200);
     assert.deepEqual(await lookup.json(), {
@@ -359,17 +418,93 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     assert.deepEqual(lookupQuery.values, [room.code]);
 
     const invalidLookup = await fetch(`${baseUrl}/api/rooms/invalid`, {
-      headers: { Cookie: cookie },
+      headers: { Cookie: roomCookie },
     });
     assert.equal(invalidLookup.status, 400);
 
     const missingLookup = await fetch(`${baseUrl}/api/rooms/${"A".repeat(32)}`, {
-      headers: { Cookie: cookie },
+      headers: { Cookie: roomCookie },
     });
     assert.equal(missingLookup.status, 404);
 
     const unauthenticatedLookup = await fetch(`${baseUrl}/api/rooms/${room.code}`);
     assert.equal(unauthenticatedLookup.status, 401);
+
+    const invalidCreation = await fetch(`${baseUrl}/api/rooms`, {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        Cookie: roomCookie,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ name: " " }),
+    });
+    assert.equal(invalidCreation.status, 400);
+    assert.deepEqual(await invalidCreation.json(), {
+      error: "Room name must contain 1-64 characters.",
+    });
+  });
+
+  await t.test("enforces shared-file permissions and upload size limits", async (t) => {
+    const fileListUrl = `${baseUrl}/api/rooms/${roomCode}/files`;
+    const missingCapability = await fetch(fileListUrl, {
+      headers: { Cookie: roomCookie },
+    });
+    assert.equal(missingCapability.status, 403);
+
+    const client = createSocketClient(baseUrl, {
+      extraHeaders: { Origin: origin, Cookie: roomCookie },
+      transports: ["websocket"],
+    });
+    t.after(() => client.disconnect());
+    await new Promise((resolve, reject) => {
+      client.once("connect", resolve);
+      client.once("connect_error", reject);
+    });
+    const joinedRoom = new Promise((resolve) => client.once("room:joined", resolve));
+    client.emit("room:join", { code: roomCode });
+    const joined = await joinedRoom;
+    assert.equal(joined.code, roomCode);
+    assert.ok(joined.fileAccessToken);
+
+    const secondAccount = await fetch(`${baseUrl}/api/auth/register`, {
+      method: "POST",
+      headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: "other-meetup-test@example.test",
+        password: credentials.password,
+        displayName: "Other Tester",
+      }),
+    });
+    assert.equal(secondAccount.status, 201);
+    const otherCookie = secondAccount.headers.get("set-cookie").split(";")[0];
+    const otherUserAccess = await fetch(fileListUrl, {
+      headers: {
+        Cookie: otherCookie,
+        Authorization: `Bearer ${joined.fileAccessToken}`,
+      },
+    });
+    assert.equal(otherUserAccess.status, 403);
+
+    const oversizedForm = new FormData();
+    oversizedForm.append(
+      "file",
+      new Blob([Buffer.alloc(25 * 1024 * 1024 + 1)], { type: "text/plain" }),
+      "large.txt",
+    );
+    const oversizedUpload = await fetch(fileListUrl, {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        Cookie: roomCookie,
+        Authorization: `Bearer ${joined.fileAccessToken}`,
+      },
+      body: oversizedForm,
+    });
+    assert.equal(oversizedUpload.status, 413);
+    assert.deepEqual(await oversizedUpload.json(), {
+      error: "Files must be 25 MB or smaller.",
+    });
   });
 
   await t.test("returns JSON for unknown API routes", async () => {

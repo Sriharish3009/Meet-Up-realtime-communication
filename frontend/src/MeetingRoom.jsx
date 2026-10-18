@@ -616,6 +616,12 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
             audio: true,
             video: false,
           })
+          setError(
+            videoError.name === 'NotAllowedError' ||
+              videoError.name === 'PermissionDeniedError'
+              ? 'Camera access was denied. You joined with audio only.'
+              : 'Camera unavailable. You joined with audio only.',
+          )
         } catch (audioError) {
           console.warn(
             'Audio-only request failed; joining without local media:',
@@ -623,6 +629,17 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
           )
 
           stream = new MediaStream()
+          const permissionDenied = [
+            videoError.name,
+            audioError.name,
+          ].some((name) => (
+            name === 'NotAllowedError' || name === 'PermissionDeniedError'
+          ))
+          setError(
+            permissionDenied
+              ? 'Camera or microphone permission was denied. You joined without local media.'
+              : 'Camera and microphone are unavailable. You joined without local media.',
+          )
         }
       }
 

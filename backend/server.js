@@ -1225,6 +1225,10 @@ app.use("/api", (req, res) => {
 app.use((error, req, res, _next) => {
   if (res.headersSent) return;
 
+  if (error.type === "entity.parse.failed") {
+    return res.status(400).json({ error: "The request body is invalid." });
+  }
+
   if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ error: "Files must be 25 MB or smaller." });
   }
