@@ -1,0 +1,107 @@
+:root,
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --page-bg: #121720;
+  --surface: #171e28;
+  --surface-raised: #1c2531;
+  --surface-hover: #222d3b;
+  --border: #2b3644;
+  --border-strong: #3b4859;
+  --text-primary: #e7edf5;
+  --text-secondary: #b5c0ce;
+  --text-muted: #8997a8;
+  --text-subtle: #738194;
+  --accent: #80aaff;
+  --accent-hover: #9bbaff;
+  --accent-soft: #22344f;
+  --accent-border: #36547f;
+  --button-primary-text: #101a29;
+  --text-danger: #ff9e9e;
+  --participant-bg: #202a37;
+  --participant-featured-bg: #243247;
+  --canvas-bg: #18212d;
+  --canvas-dot: #39485a;
+  --font-sans: "Segoe UI", Inter, ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Cascadia Code", Consolas, ui-monospace, monospace;
+
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: var(--page-bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  font-optical-sizing: auto;
+}
+
+:root[data-theme='light'] {
+  color-scheme: light;
+  --page-bg: #f3f5f8;
+  --surface: #f9fafc;
+  --surface-raised: #ffffff;
+  --surface-hover: #edf1f6;
+  --border: #dce2ea;
+  --border-strong: #c7d0dc;
+  --text-primary: #1d2938;
+  --text-secondary: #48596c;
+  --text-muted: #65768a;
+  --text-subtle: #7b8999;
+  --accent: #2c5fbe;
+  --accent-hover: #214f9f;
+  --accent-soft: #e8effc;
+  --accent-border: #c6d5f1;
+  --button-primary-text: #ffffff;
+  --text-danger: #a92f39;
+  --participant-bg: #edf1f6;
+  --participant-featured-bg: #e7edf7;
+  --canvas-bg: #f8f9fb;
+  --canvas-dot: #cbd3df;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--page-bg);
+}
+
+body,
+button,
+input {
+  font-family: var(--font-sans);
+}
+
+button,
+input {
+  font-size: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+::selection {
+  color: var(--button-primary-text);
+  background: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
