@@ -21,9 +21,7 @@ import {
   LoaderCircle,
 } from 'lucide-react'
 import './App.css'
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
-const SOCKET_URL = API_URL
+import { API_URL, parseApiResponseText, readApiResponse } from './api'
 
 const ICE_SERVERS = {
   iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -246,7 +244,7 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
           headers: { Authorization: `Bearer ${token}` },
         },
       )
-      const data = await response.json()
+      const data = await readApiResponse(response)
 
       if (!response.ok) throw new Error(data.error || 'Could not load shared files.')
       if (!joinedRef.current || fileAccessTokenRef.current !== token) return
@@ -297,7 +295,7 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
 
       let data
       try {
-        data = JSON.parse(request.responseText)
+        data = parseApiResponseText(request.responseText, request.status)
       } catch {
         data = {}
       }
@@ -342,7 +340,7 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
       if (!response.ok) {
         let data = {}
         try {
-          data = await response.json()
+          data = await readApiResponse(response)
         } catch {
           data = {}
         }
@@ -592,6 +590,16 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
     let stream
 
     try {
+      const sessionResponse = await fetch(`${API_URL}/api/auth/me`, {
+        credentials: 'include',
+      })
+      const sessionData = await readApiResponse(sessionResponse)
+      if (!sessionResponse.ok) {
+        throw new Error(
+          sessionData.error || 'Your sign-in session has expired. Sign in again.',
+        )
+      }
+
       try {
         stream = await navigator.mediaDevices.getUserMedia({
           audio: true,
@@ -625,7 +633,7 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
       setMicEnabled(stream.getAudioTracks().some((track) => track.enabled))
       setCameraEnabled(stream.getVideoTracks().some((track) => track.enabled))
 
-      const socket = io(SOCKET_URL, { withCredentials: true })
+      const socket = io(API_URL, { withCredentials: true })
       socketRef.current = socket
       setMeetingSocket(socket)
 
@@ -879,8 +887,12 @@ function MeetingRoom({ roomCode, displayName, onLeave }) {
       })
 
       socket.on('connect_error', (err) => {
-        console.error('Socket connection error:', err)
-        setError('Could not connect to the meeting server.')
+        console.error('Socket connection error:', err.message)
+        setError(
+          err.message === 'Authentication required.'
+            ? 'Your sign-in session has expired. Sign in again before joining.'
+            : 'Could not connect to the meeting server.',
+        )
         setJoining(false)
       })
     } catch (err) {

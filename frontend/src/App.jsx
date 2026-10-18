@@ -26,8 +26,7 @@ import {
 } from 'lucide-react'
 import './App.css'
 import MeetingRoom from './MeetingRoom'
-
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000'
+import { apiFetch, readApiResponse } from './api'
 
 const navigation = [
   { label: 'Dashboard', icon: LayoutDashboard },
@@ -76,10 +75,12 @@ function App() {
   )
 
   useEffect(() => {
-    fetch(`${API_URL}/api/health`)
+    apiFetch('/api/health')
       .then((response) => {
-        if (!response.ok) throw new Error('Backend request failed')
-        return response.json()
+        return readApiResponse(response).then((data) => {
+          if (!response.ok) throw new Error(data.error || 'Backend request failed')
+          return data
+        })
       })
       .then((data) => setBackendStatus(data.message))
       .catch(() => setBackendStatus('Backend connection failed'))
@@ -88,10 +89,10 @@ function App() {
   useEffect(() => {
     let isCurrent = true
 
-    fetch(`${API_URL}/api/auth/me`, { credentials: 'include' })
+    apiFetch('/api/auth/me')
       .then(async (response) => {
         if (response.status === 401) return null
-        const data = await response.json()
+        const data = await readApiResponse(response)
         if (!response.ok) throw new Error(data.error || 'Could not restore your session.')
         return data.user
       })
@@ -114,9 +115,9 @@ function App() {
     if (!authUser) return undefined
     let isCurrent = true
 
-    fetch(`${API_URL}/api/rooms`, { credentials: 'include' })
+    apiFetch('/api/rooms')
       .then(async (response) => {
-        const data = await response.json()
+        const data = await readApiResponse(response)
         if (!response.ok) throw new Error(data.error || 'Could not load meeting rooms.')
         return data
       })
@@ -184,13 +185,12 @@ function App() {
     if (authMode === 'register') payload.displayName = form.get('displayName')
 
     try {
-      const response = await fetch(`${API_URL}/api/auth/${authMode}`, {
+      const response = await apiFetch(`/api/auth/${authMode}`, {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       })
-      const data = await response.json()
+      const data = await readApiResponse(response)
       if (!response.ok) throw new Error(data.error || 'Could not sign in.')
       setAuthUser(data.user)
       setAuthError('')
@@ -204,12 +204,11 @@ function App() {
   const signOut = async () => {
     setAuthError('')
     try {
-      const response = await fetch(`${API_URL}/api/auth/logout`, {
+      const response = await apiFetch('/api/auth/logout', {
         method: 'POST',
-        credentials: 'include',
       })
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
+        const data = await readApiResponse(response)
         throw new Error(data.error || 'Could not end the current session.')
       }
       setAuthUser(null)
@@ -239,14 +238,13 @@ function App() {
     }
 
     try {
-      const response = await fetch(`${API_URL}/api/rooms`, {
+      const response = await apiFetch('/api/rooms', {
         method: 'POST',
-        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       })
 
-      const data = await response.json()
+      const data = await readApiResponse(response)
 
       if (!response.ok) {
         throw new Error(data.error || 'Could not create meeting room.')
@@ -281,12 +279,9 @@ function App() {
     }
 
     try {
-      const response = await fetch(
-        `${API_URL}/api/rooms/${encodeURIComponent(code)}`,
-        { credentials: 'include' },
-      )
+      const response = await apiFetch(`/api/rooms/${encodeURIComponent(code)}`)
 
-      const room = await response.json()
+      const room = await readApiResponse(response)
 
       if (!response.ok) {
         throw new Error(room.error || 'Meeting room not found.')

@@ -689,6 +689,36 @@ app.get("/api/rooms", requireAuth, (req, res) => {
   res.json(roomList);
 });
 
+app.get("/api/rooms/:code", requireAuth, async (req, res) => {
+  const code = String(req.params.code || "").trim().toUpperCase();
+  if (!ROOM_CODE_PATTERN.test(code)) {
+    return res.status(400).json({ error: "Meeting code is invalid." });
+  }
+
+  const result = await database.query(`
+    SELECT code, name, owner_user_id
+    FROM meeting_rooms
+    WHERE code = $1
+  `, [code]);
+  const savedRoom = result.rows[0];
+  if (!savedRoom) {
+    return res.status(404).json({ error: "Room not found. Check the meeting code." });
+  }
+
+  let room = rooms.get(code);
+  if (!room) {
+    room = createRoomState(savedRoom.name, savedRoom.owner_user_id);
+    rooms.set(code, room);
+  }
+
+  return res.json({
+    id: code,
+    name: room.name,
+    code,
+    participants: getParticipants(code),
+  });
+});
+
 // Create room
 // Create room
 app.post("/api/rooms", requireAuth, async (req, res) => {
@@ -1186,6 +1216,10 @@ io.on("connection", (socket) => {
     clearTimeout(socket.data.sessionExpiryTimer);
     console.log("Disconnected:", socket.id);
   });
+});
+
+app.use("/api", (req, res) => {
+  return res.status(404).json({ error: "API endpoint not found." });
 });
 
 app.use((error, req, res, _next) => {

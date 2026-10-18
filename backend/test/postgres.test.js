@@ -2,6 +2,43 @@ const assert = require("node:assert/strict");
 const Module = require("node:module");
 const { test } = require("node:test");
 
+test("frontend API helpers target the backend and safely parse error bodies", async () => {
+  const { resolveApiUrl } = await import("../../frontend/src/api-config.js");
+  const { parseApiResponseText } = await import("../../frontend/src/api-response.js");
+
+  assert.equal(
+    resolveApiUrl({
+      configuredApiUrl: undefined,
+      isProduction: true,
+      frontendOrigin: "https://meet-up-realtime-communication.vercel.app",
+    }),
+    "https://meet-up-realtime-communication.onrender.com",
+  );
+  assert.equal(
+    resolveApiUrl({
+      configuredApiUrl: "https://meet-up-realtime-communication.vercel.app",
+      isProduction: true,
+      frontendOrigin: "https://meet-up-realtime-communication.vercel.app",
+    }),
+    "https://meet-up-realtime-communication.onrender.com",
+  );
+  assert.equal(
+    resolveApiUrl({
+      configuredApiUrl: "https://api.example.test/",
+      isProduction: true,
+      frontendOrigin: "https://meet-up-realtime-communication.vercel.app",
+    }),
+    "https://api.example.test",
+  );
+  assert.deepEqual(
+    parseApiResponseText("<!DOCTYPE html><html></html>", 404),
+    { error: "The server returned an unexpected response (HTTP 404)." },
+  );
+  assert.deepEqual(parseApiResponseText('{"error":"Not found"}', 404), {
+    error: "Not found",
+  });
+});
+
 const TEST_DATABASE_URL =
   "postgresql://unit-test.invalid/meetup_test?sslmode=disable";
 process.env.DATABASE_URL = TEST_DATABASE_URL;
@@ -125,6 +162,10 @@ class MockPool {
     }
 
     if (normalizedSql.startsWith("SELECT code, name, owner_user_id FROM meeting_rooms")) {
+      if (normalizedSql.includes("WHERE code = $1")) {
+        const room = rooms.get(values[0]);
+        return { rows: room ? [room] : [], rowCount: room ? 1 : 0 };
+      }
       return { rows: [...rooms.values()], rowCount: rooms.size };
     }
 
@@ -301,6 +342,42 @@ test("PostgreSQL schema, authentication, sessions, and room creation", async (t)
     assert.match(room.code, /^[0-9A-F]{32}$/);
     assert.equal(room.name, "Automated test room");
     assert.equal(rooms.get(room.code).owner_user_id, users.values().next().value.id);
+
+    const lookup = await fetch(`${baseUrl}/api/rooms/${room.code.toLowerCase()}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(lookup.status, 200);
+    assert.deepEqual(await lookup.json(), {
+      id: room.code,
+      name: "Automated test room",
+      code: room.code,
+      participants: [],
+    });
+    const lookupQuery = statements.findLast(({ sql }) =>
+      sql.includes("WHERE code = $1"));
+    assert.ok(lookupQuery);
+    assert.deepEqual(lookupQuery.values, [room.code]);
+
+    const invalidLookup = await fetch(`${baseUrl}/api/rooms/invalid`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(invalidLookup.status, 400);
+
+    const missingLookup = await fetch(`${baseUrl}/api/rooms/${"A".repeat(32)}`, {
+      headers: { Cookie: cookie },
+    });
+    assert.equal(missingLookup.status, 404);
+
+    const unauthenticatedLookup = await fetch(`${baseUrl}/api/rooms/${room.code}`);
+    assert.equal(unauthenticatedLookup.status, 401);
+  });
+
+  await t.test("returns JSON for unknown API routes", async () => {
+    const response = await fetch(`${baseUrl}/api/not-a-route`);
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), {
+      error: "API endpoint not found.",
+    });
   });
 
   await t.test("uses parameterized SQL for user-provided values", () => {
