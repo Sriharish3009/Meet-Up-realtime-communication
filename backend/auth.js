@@ -212,7 +212,7 @@ function sessionCookie(token, maxAgeSeconds) {
     `${SESSION_COOKIE_NAME}=${token}`,
     "Path=/",
     "HttpOnly",
-    "SameSite=Lax",
+    `SameSite=${COOKIE_SECURE ? "None" : "Lax"}`,
     `Max-Age=${maxAgeSeconds}`,
   ];
   if (COOKIE_SECURE) attributes.push("Secure");
@@ -224,7 +224,7 @@ function clearSessionCookie() {
     `${SESSION_COOKIE_NAME}=`,
     "Path=/",
     "HttpOnly",
-    "SameSite=Lax",
+    `SameSite=${COOKIE_SECURE ? "None" : "Lax"}`,
     "Max-Age=0",
   ];
   if (COOKIE_SECURE) attributes.push("Secure");
