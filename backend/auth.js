@@ -75,12 +75,12 @@ async function registerUser(input) {
   };
 
   try {
-    database.prepare(`
+    await database.query(`
       INSERT INTO users (id, email, display_name, password_salt, password_hash, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(user.id, user.email, user.displayName, user.salt, user.passwordHash, user.createdAt);
+      VALUES ($1, $2, $3, $4, $5, $6)
+    `, [user.id, user.email, user.displayName, user.salt, user.passwordHash, user.createdAt]);
   } catch (error) {
-    if (error.code === "SQLITE_CONSTRAINT_UNIQUE") {
+    if (error.code === "23505" && error.constraint === "users_email_key") {
       const duplicate = new Error("An account with this email already exists.");
       duplicate.status = 409;
       throw duplicate;
@@ -103,11 +103,12 @@ async function verifyCredentials(input) {
     throw error;
   }
 
-  const user = database.prepare(`
+  const result = await database.query(`
     SELECT id, email, display_name, password_salt, password_hash
     FROM users
-    WHERE email = ?
-  `).get(validated.email);
+    WHERE email = $1
+  `, [validated.email]);
+  const user = result.rows[0];
 
   if (!user) {
     const fakeSalt = Buffer.alloc(PASSWORD_SALT_BYTES);
@@ -135,41 +136,42 @@ function hashSessionToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-function createSession(userId) {
+async function createSession(userId) {
   const token = crypto.randomBytes(32).toString("base64url");
   const tokenHash = hashSessionToken(token);
   const createdAt = Date.now();
   const expiresAt = createdAt + SESSION_TTL_MS;
 
-  database.prepare(`
+  await database.query(`
     INSERT INTO sessions (token_hash, user_id, expires_at, revoked_at, created_at)
-    VALUES (?, ?, ?, NULL, ?)
-  `).run(tokenHash, userId, expiresAt, createdAt);
+    VALUES ($1, $2, $3, NULL, $4)
+  `, [tokenHash, userId, expiresAt, createdAt]);
 
   return { token, tokenHash, expiresAt };
 }
 
-function findActiveSession(token) {
+async function findActiveSession(token) {
   if (!token || typeof token !== "string" || token.length > 256) return null;
   return findActiveSessionByHash(hashSessionToken(token));
 }
 
-function findActiveSessionByHash(tokenHash) {
+async function findActiveSessionByHash(tokenHash) {
   if (!tokenHash || typeof tokenHash !== "string") return null;
-  const session = database.prepare(`
+  const result = await database.query(`
     SELECT sessions.token_hash, sessions.user_id, sessions.expires_at,
            users.email, users.display_name
     FROM sessions
     JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ?
+    WHERE sessions.token_hash = $1
       AND sessions.revoked_at IS NULL
-      AND sessions.expires_at > ?
-  `).get(tokenHash, Date.now());
+      AND sessions.expires_at > $2
+  `, [tokenHash, Date.now()]);
+  const session = result.rows[0];
 
   if (!session) return null;
   return {
     tokenHash: session.token_hash,
-    expiresAt: session.expires_at,
+    expiresAt: Number(session.expires_at),
     user: publicUser({
       id: session.user_id,
       email: session.email,
@@ -178,14 +180,14 @@ function findActiveSessionByHash(tokenHash) {
   };
 }
 
-function revokeSession(token) {
+async function revokeSession(token) {
   if (!token || typeof token !== "string" || token.length > 256) return false;
-  const result = database.prepare(`
+  const result = await database.query(`
     UPDATE sessions
-    SET revoked_at = ?
-    WHERE token_hash = ? AND revoked_at IS NULL
-  `).run(Date.now(), hashSessionToken(token));
-  return result.changes > 0;
+    SET revoked_at = $1
+    WHERE token_hash = $2 AND revoked_at IS NULL
+  `, [Date.now(), hashSessionToken(token)]);
+  return result.rowCount > 0;
 }
 
 function parseCookieHeader(header = "") {
@@ -231,15 +233,19 @@ function clearSessionCookie() {
   return attributes.join("; ");
 }
 
-function requireAuth(request, response, next) {
-  const token = readSessionToken(request);
-  const session = findActiveSession(token);
-  if (!session) {
-    return response.status(401).json({ error: "Sign in to continue." });
-  }
+async function requireAuth(request, response, next) {
+  try {
+    const token = readSessionToken(request);
+    const session = await findActiveSession(token);
+    if (!session) {
+      return response.status(401).json({ error: "Sign in to continue." });
+    }
 
-  request.auth = { ...session, token };
-  next();
+    request.auth = { ...session, token };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
 }
 
 function createOriginValidator(frontendOrigin) {

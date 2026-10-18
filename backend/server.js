@@ -1,4 +1,5 @@
 
+const database = require("./database");
 const express = require("express");
 const http = require("http");
 const cors = require("cors");
@@ -8,7 +9,6 @@ const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 const { Server } = require("socket.io");
-require("dotenv").config();
 const {
   SESSION_TTL_MS,
   clearSessionCookie,
@@ -85,8 +85,35 @@ const io = new Server(server, {
   },
 });
 
-// Temporary in-memory room storage
 const rooms = new Map();
+
+function createRoomState(name, ownerUserId) {
+  return {
+    name,
+    ownerUserId,
+    participants: new Map(),
+    files: new Map(),
+    whiteboard: {
+      strokes: [],
+      strokeIds: new Set(),
+      pointCount: 0,
+      retainedBytes: 0,
+      revision: 0,
+    },
+  };
+}
+
+async function restoreRooms() {
+  const result = await database.query(`
+    SELECT code, name, owner_user_id
+    FROM meeting_rooms
+  `);
+
+  for (const room of result.rows) {
+    rooms.set(room.code, createRoomState(room.name, room.owner_user_id));
+  }
+}
+
 const fileAccessTokens = new Map();
 const authRateLimits = new Map();
 const roomCodeRateLimits = new Map();
@@ -333,7 +360,7 @@ app.post(
   requireAuth,
   requireRoomFileAccess,
   (req, res, next) => upload.single("file")(req, res, next),
-  (req, res, next) => {
+  async (req, res, next) => {
     if (!req.file) {
       return res.status(400).json({ error: "Choose a file to upload." });
     }
@@ -362,11 +389,14 @@ app.post(
 
     const room = rooms.get(req.fileRoomCode);
     const uploaderSocket = io.sockets.sockets.get(req.fileUploader.id);
+    const uploaderSession = await findActiveSessionByHash(
+      uploaderSocket?.data.auth?.tokenHash,
+    );
     if (
       !room?.participants.has(req.fileUploader.id) ||
       room.participants.get(req.fileUploader.id).userId !== req.auth.user.id ||
       !uploaderSocket?.connected ||
-      !findActiveSessionByHash(uploaderSocket.data.auth?.tokenHash)
+      !uploaderSession
     ) {
       discardUploadedFile(req.file.path);
       return res.status(403).json({ error: "You have left this meeting." });
@@ -478,11 +508,18 @@ function leaveCurrentRooms(socket) {
   }
 }
 
-function getActiveSocketSession(socket) {
+async function getActiveSocketSession(socket) {
   const auth = socket.data.auth;
   if (!auth) return null;
 
-  const session = findActiveSessionByHash(auth.tokenHash);
+  let session;
+  try {
+    session = await findActiveSessionByHash(auth.tokenHash);
+  } catch {
+    console.error("Socket session validation failed.");
+    socket.disconnect(true);
+    return null;
+  }
   if (!session || session.user.id !== auth.user.id) {
     socket.disconnect(true);
     return null;
@@ -496,8 +533,8 @@ function getActiveSocketSession(socket) {
   return session;
 }
 
-function getSocketRoom(socket) {
-  const auth = getActiveSocketSession(socket);
+async function getSocketRoom(socket) {
+  const auth = await getActiveSocketSession(socket);
   if (!auth) return null;
 
   for (const roomCode of socket.rooms) {
@@ -514,7 +551,7 @@ function getSocketRoom(socket) {
   return null;
 }
 
-function getAuthorizedSignalTarget(socket, targetId) {
+async function getAuthorizedSignalTarget(socket, targetId) {
   if (
     typeof targetId !== "string" ||
     !targetId ||
@@ -522,16 +559,16 @@ function getAuthorizedSignalTarget(socket, targetId) {
     targetId === socket.id
   ) return null;
 
-  const senderRoom = getSocketRoom(socket);
+  const senderRoom = await getSocketRoom(socket);
   const targetSocket = io.sockets.sockets.get(targetId);
   if (!senderRoom || !targetSocket?.connected) return null;
 
-  const targetRoom = getSocketRoom(targetSocket);
+  const targetRoom = await getSocketRoom(targetSocket);
   if (!targetRoom || targetRoom.code !== senderRoom.code) return null;
   return { targetSocket, room: senderRoom.room };
 }
 
-io.use((socket, next) => {
+io.use(async (socket, next) => {
   const origin = socket.handshake.headers.origin;
   if (origin !== FRONTEND_ORIGIN) {
     next(new Error("Socket connection origin is not allowed."));
@@ -539,7 +576,14 @@ io.use((socket, next) => {
   }
 
   const token = readSessionToken(socket);
-  const session = findActiveSession(token);
+  let session;
+  try {
+    session = await findActiveSession(token);
+  } catch {
+    console.error("Socket authentication could not be completed.");
+    next(new Error("Authentication service unavailable."));
+    return;
+  }
   if (!session) {
     next(new Error("Authentication required."));
     return;
@@ -553,7 +597,11 @@ io.use((socket, next) => {
 
   const delay = Math.max(0, session.expiresAt - Date.now());
   socket.data.sessionExpiryTimer = setTimeout(() => {
-    if (!findActiveSessionByHash(session.tokenHash)) socket.disconnect(true);
+    void findActiveSessionByHash(session.tokenHash)
+      .then((activeSession) => {
+        if (!activeSession) socket.disconnect(true);
+      })
+      .catch(() => socket.disconnect(true));
   }, delay);
   socket.data.sessionExpiryTimer.unref?.();
   next();
@@ -561,17 +609,25 @@ io.use((socket, next) => {
 
 
 // Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    message: "Real-Time Communication API is running",
-  });
+app.get("/api/health", async (req, res) => {
+  try {
+    await database.healthCheck();
+    return res.json({
+      status: "ok",
+      message: "Real-Time Communication API is running",
+    });
+  } catch {
+    return res.status(503).json({
+      status: "unavailable",
+      message: "Real-Time Communication API is temporarily unavailable",
+    });
+  }
 });
 
 app.post("/api/auth/register", checkAuthRateLimit, async (req, res, next) => {
   try {
     const user = await registerUser(req.body || {});
-    const session = createSession(user.id);
+    const session = await createSession(user.id);
     setSessionCookie(res, session);
     return res.status(201).json({ user, expiresAt: session.expiresAt });
   } catch (error) {
@@ -585,7 +641,7 @@ app.post("/api/auth/login", checkAuthRateLimit, async (req, res, next) => {
     const user = await verifyCredentials(req.body || {});
     if (!user) return res.status(401).json({ error: "Email or password is incorrect." });
 
-    const session = createSession(user.id);
+    const session = await createSession(user.id);
     setSessionCookie(res, session);
     return res.json({ user, expiresAt: session.expiresAt });
   } catch (error) {
@@ -598,21 +654,25 @@ app.get("/api/auth/me", requireAuth, (req, res) => {
   res.json({ user: req.auth.user, expiresAt: req.auth.expiresAt });
 });
 
-app.post("/api/auth/logout", (req, res) => {
-  const token = readSessionToken(req);
-  const session = findActiveSession(token);
-  revokeSession(token);
-  res.setHeader("Set-Cookie", clearSessionCookie());
+app.post("/api/auth/logout", async (req, res, next) => {
+  try {
+    const token = readSessionToken(req);
+    const session = await findActiveSession(token);
+    await revokeSession(token);
+    res.setHeader("Set-Cookie", clearSessionCookie());
 
-  if (session) {
-    for (const socket of io.sockets.sockets.values()) {
-      if (socket.data.auth?.tokenHash === session.tokenHash) {
-        socket.disconnect(true);
+    if (session) {
+      for (const socket of io.sockets.sockets.values()) {
+        if (socket.data.auth?.tokenHash === session.tokenHash) {
+          socket.disconnect(true);
+        }
       }
     }
-  }
 
-  return res.status(204).end();
+    return res.status(204).end();
+  } catch (error) {
+    return next(error);
+  }
 });
 
 // List rooms
@@ -630,7 +690,8 @@ app.get("/api/rooms", requireAuth, (req, res) => {
 });
 
 // Create room
-app.post("/api/rooms", requireAuth, (req, res) => {
+// Create room
+app.post("/api/rooms", requireAuth, async (req, res) => {
   const name = String(req.body?.name || "").trim();
 
   if (!name || name.length > 64) {
@@ -640,48 +701,34 @@ app.post("/api/rooms", requireAuth, (req, res) => {
   }
 
   const code = createRoomCode();
+  const ownerUserId = req.auth.user.id;
 
-  rooms.set(code, {
-    name,
-    ownerUserId: req.auth.user.id,
-    participants: new Map(),
-    files: new Map(),
-    whiteboard: {
-      strokes: [],
-      strokeIds: new Set(),
-      pointCount: 0,
-      retainedBytes: 0,
-      revision: 0,
-    },
-  });
+  try {
+    await database.query(`
+      INSERT INTO meeting_rooms (code, name, owner_user_id, created_at)
+      VALUES ($1, $2, $3, $4)
+    `, [
+      code,
+      name,
+      ownerUserId,
+      new Date(),
+    ]);
 
-  return res.status(201).json({
-    id: code,
-    name,
-    code,
-    participants: [],
-  });
-});
+    rooms.set(code, createRoomState(name, ownerUserId));
 
-// Find room
-app.get("/api/rooms/:code", requireAuth, (req, res) => {
-  if (isRoomCodeRateLimited(req.ip)) return sendRoomCodeRateLimit(res);
+    return res.status(201).json({
+      id: code,
+      name,
+      code,
+      participants: [],
+    });
+  } catch (error) {
+    console.error("Could not create meeting room.");
 
-  const code = String(req.params.code || "").trim().toUpperCase();
-  const room = rooms.get(code);
-
-  if (!ROOM_CODE_PATTERN.test(code) || !room) {
-    if (recordRoomCodeFailure(req.ip)) return sendRoomCodeRateLimit(res);
-    return res.status(404).json({
-      error: "Meeting room not found. Check the meeting code.",
+    return res.status(500).json({
+      error: "Could not create the meeting. Please try again.",
     });
   }
-
-  return res.json({
-    id: code,
-    name: room.name,
-    code,
-  });
 });
 
 // Socket.IO
@@ -689,7 +736,7 @@ io.on("connection", (socket) => {
   console.log("Authenticated connection:", socket.id);
 
   socket.on("room:join", async (payload = {}) => {
-    const auth = getActiveSocketSession(socket);
+    const auth = await getActiveSocketSession(socket);
     if (!auth) return;
     const ip = socket.handshake.address || "unknown";
     if (isRoomCodeRateLimited(ip)) {
@@ -724,7 +771,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const currentAuth = getActiveSocketSession(socket);
+    const currentAuth = await getActiveSocketSession(socket);
     if (!currentAuth) {
       socket.leave(code);
       return;
@@ -788,9 +835,9 @@ io.on("connection", (socket) => {
     respond({ ok: false, error: "You are not a member of this meeting." });
   });
 
-  socket.on("chat:send", (payload, acknowledge) => {
+  socket.on("chat:send", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
-    const senderRoom = getSocketRoom(socket);
+    const senderRoom = await getSocketRoom(socket);
 
     if (!senderRoom) {
       respond({ ok: false, error: "Join a meeting before sending messages." });
@@ -833,9 +880,9 @@ io.on("connection", (socket) => {
     respond({ ok: true, id: chatMessage.id });
   });
 
-  socket.on("whiteboard:stroke", (payload, acknowledge) => {
+  socket.on("whiteboard:stroke", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
-    const senderRoom = getSocketRoom(socket);
+    const senderRoom = await getSocketRoom(socket);
 
     if (!senderRoom) {
       respond({ ok: false, error: "Join a meeting before drawing." });
@@ -957,9 +1004,9 @@ io.on("connection", (socket) => {
     respond({ ok: true, id: storedStroke.id, revision: board.revision });
   });
 
-  socket.on("whiteboard:clear", (payload, acknowledge) => {
+  socket.on("whiteboard:clear", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
-    const senderRoom = getSocketRoom(socket);
+    const senderRoom = await getSocketRoom(socket);
 
     if (!senderRoom) {
       respond({ ok: false, error: "Join a meeting before clearing the board." });
@@ -994,7 +1041,7 @@ io.on("connection", (socket) => {
 
   // Limits: 64 KiB per SDP, 4 KiB per ICE candidate, 256-character metadata,
   // 72 KiB per SDP signal, and 8 KiB per ICE signal.
-  socket.on("webrtc:offer", (payload, acknowledge) => {
+  socket.on("webrtc:offer", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
     if (
       !payload ||
@@ -1020,7 +1067,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const target = getAuthorizedSignalTarget(socket, targetId);
+    const target = await getAuthorizedSignalTarget(socket, targetId);
     if (!target) {
       respond({ ok: false, error: "The signaling target is not in your meeting." });
       return;
@@ -1033,7 +1080,7 @@ io.on("connection", (socket) => {
     respond({ ok: true });
   });
 
-  socket.on("webrtc:answer", (payload, acknowledge) => {
+  socket.on("webrtc:answer", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
     if (
       !payload ||
@@ -1059,7 +1106,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const target = getAuthorizedSignalTarget(socket, targetId);
+    const target = await getAuthorizedSignalTarget(socket, targetId);
     if (!target) {
       respond({ ok: false, error: "The signaling target is not in your meeting." });
       return;
@@ -1072,7 +1119,7 @@ io.on("connection", (socket) => {
     respond({ ok: true });
   });
 
-  socket.on("webrtc:ice-candidate", (payload, acknowledge) => {
+  socket.on("webrtc:ice-candidate", async (payload, acknowledge) => {
     const respond = typeof acknowledge === "function" ? acknowledge : () => {};
     if (
       !payload ||
@@ -1109,7 +1156,7 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const target = getAuthorizedSignalTarget(socket, targetId);
+    const target = await getAuthorizedSignalTarget(socket, targetId);
     if (!target) {
       respond({ ok: false, error: "The signaling target is not in your meeting." });
       return;
@@ -1156,10 +1203,52 @@ app.use((error, req, res, _next) => {
     return res.status(400).json({ error: error.message });
   }
 
-  console.error("Request failed:", error);
+  console.error("Request failed.");
   return res.status(500).json({ error: "The server could not complete this request." });
 });
 
-server.listen(PORT, () => {
-  console.log(`Backend running at http://localhost:${PORT}`);
-});
+let isShuttingDown = false;
+async function startServer() {
+  try {
+    await database.initializeDatabase();
+    if (isShuttingDown) return;
+    await restoreRooms();
+    if (isShuttingDown) return;
+    server.listen(PORT, () => {
+      console.log(`Backend running on port ${PORT}`);
+    });
+  } catch {
+    console.error("Backend startup failed. Check PostgreSQL connectivity and configuration.");
+    process.exitCode = 1;
+    await database.closeDatabase().catch(() => {
+      console.error("Could not close the PostgreSQL connection pool.");
+    });
+  }
+}
+
+let shutdownPromise;
+async function shutdown() {
+  if (shutdownPromise) return shutdownPromise;
+  isShuttingDown = true;
+
+  shutdownPromise = (async () => {
+    await new Promise((resolve) => io.close(resolve));
+    await database.closeDatabase();
+    console.log("Backend shut down cleanly.");
+  })();
+
+  try {
+    await shutdownPromise;
+  } catch {
+    console.error("Backend shutdown encountered an error.");
+    process.exitCode = 1;
+  }
+}
+
+if (require.main === module) {
+  process.once("SIGINT", () => void shutdown());
+  process.once("SIGTERM", () => void shutdown());
+  void startServer();
+}
+
+module.exports = { app, io, restoreRooms, server, shutdown, startServer };
